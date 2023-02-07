@@ -207,7 +207,7 @@ def main(args):
         elif args.byz_type == 'lie_backdoor': # A little is enough
             mal_grad_list = []
             for mal_id in mal_clients:
-                mal_grad = attack.lie_backdoor(grad_list[mal_id], net, local_net, bd_train_data[mal_id].to(ctx), bd_train_label[mal_id].to(ctx), ctx, args, args.bd_type, 4)
+                mal_grad = attack.lie_backdoor(grad_list[nbyz:], net, local_net, bd_train_data[mal_id].to(ctx), bd_train_label[mal_id].to(ctx), ctx, args, args.bd_type, 0.8)
                 grad_list[mal_id] = mal_grad
 
         if args.aggregation == "fltrust":

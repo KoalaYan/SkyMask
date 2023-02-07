@@ -5,6 +5,9 @@ import numpy as np
 import os
 from copy import deepcopy
 from sklearn.decomposition import PCA
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
+from sklearn.metrics import roc_auc_score
 
 import utils
 import classify
@@ -217,7 +220,7 @@ def skymask(grad_list, datalist, masknet, ctx, niter, server_data, server_label,
 
     for i in range(n):
         if res[i] == 1:
-            new_param_list.append(grad_list[i] * weights / (torch.norm(grad_list[i]) + 1e-9) * torch.norm(baseline))
+            new_param_list.append(grad_list[i] * weights)# / (torch.norm(grad_list[i]) + 1e-9) * torch.norm(baseline))
     
     global_update = torch.sum(torch.cat(new_param_list, dim=1), dim=-1)
 
@@ -314,7 +317,7 @@ def Tolpegin(grad_list, niter, net, args, log_file):
 
     for i in range(n):
         if res[i] == 1:
-            new_param_list.append(grad_list[i] * weights / (torch.norm(grad_list[i]) + 1e-9))
+            new_param_list.append(grad_list[i] * weights)# / (torch.norm(grad_list[i]) + 1e-9))
     
     global_update = torch.sum(torch.cat(new_param_list, dim=1), dim=-1)
 
@@ -511,4 +514,236 @@ def bulyan(gradients, net, args):
             model_dict[name] = data_list[j]
             j += 1
 
+    return model_dict
+
+
+weight_record = []
+grad_record = []
+old_grad_list = []
+last_weight = None
+last_grad = None
+def FLDetection(param_list, net, niter, args, log_file):
+    global weight_record, grad_record, old_grad_list, last_weight, last_grad
+    def lbfgs(S_k_list, Y_k_list, v):
+        curr_S_k = torch.cat(S_k_list, dim=1)
+        curr_Y_k = torch.cat(Y_k_list, dim=1)
+        S_k_time_Y_k = torch.dot(curr_S_k.T, curr_Y_k)
+        S_k_time_S_k = torch.dot(curr_S_k.T, curr_S_k)
+        R_k = np.triu(S_k_time_Y_k.asnumpy())
+        L_k = S_k_time_Y_k - torch.array(R_k)
+        sigma_k = torch.dot(Y_k_list[-1].T, S_k_list[-1]) / (torch.dot(S_k_list[-1].T, S_k_list[-1]))
+        D_k_diag = torch.diag(S_k_time_Y_k)
+        upper_mat = torch.cat([sigma_k * S_k_time_S_k, L_k], dim=1)
+        lower_mat = torch.cat([L_k.T, -torch.diag(D_k_diag)], dim=1)
+        mat = torch.cat([upper_mat, lower_mat], dim=0)
+        mat_inv = torch.inverse(mat)
+
+        approx_prod = sigma_k * v
+        p_mat = torch.cat([torch.dot(curr_S_k.T, sigma_k * v), torch.dot(curr_Y_k.T, v)], dim=0)
+        approx_prod -= torch.dot(torch.dot(torch.cat([sigma_k * curr_S_k, curr_Y_k], dim=1), mat_inv), p_mat)
+
+        return approx_prod
+
+    def detection(score, nbyz):
+        estimator = KMeans(n_clusters=2)
+        estimator.fit(score.reshape(-1, 1))
+        label_pred = estimator.labels_
+        if np.mean(score[label_pred==0])<np.mean(score[label_pred==1]):
+            #0 is the label of malicious clients
+            label_pred = 1 - label_pred
+        return label_pred
+        real_label=np.ones(100)
+        real_label[:nbyz]=0
+        acc=len(label_pred[label_pred==real_label])/100
+        recall=1-np.sum(label_pred[:nbyz])/10
+        fpr=1-np.sum(label_pred[nbyz:])/90
+        fnr=np.sum(label_pred[:nbyz])/10
+
+    def detection1(score, nbyz):
+        nrefs = 10
+        ks = range(1, 8)
+        gaps = np.zeros(len(ks))
+        gapDiff = np.zeros(len(ks) - 1)
+        sdk = np.zeros(len(ks))
+        min = np.min(score)
+        max = np.max(score)
+        score = (score - min)/(max-min)
+        for i, k in enumerate(ks):
+            estimator = KMeans(n_clusters=k)
+            estimator.fit(score.reshape(-1, 1))
+            label_pred = estimator.labels_
+            center = estimator.cluster_centers_
+            Wk = np.sum([np.square(score[m]-center[label_pred[m]]) for m in range(len(score))])
+            WkRef = np.zeros(nrefs)
+            for j in range(nrefs):
+                rand = np.random.uniform(0, 1, len(score))
+                estimator = KMeans(n_clusters=k)
+                estimator.fit(rand.reshape(-1, 1))
+                label_pred = estimator.labels_
+                center = estimator.cluster_centers_
+                WkRef[j] = np.sum([np.square(rand[m]-center[label_pred[m]]) for m in range(len(rand))])
+            gaps[i] = np.log(np.mean(WkRef)) - np.log(Wk)
+            sdk[i] = np.sqrt((1.0 + nrefs) / nrefs) * np.std(np.log(WkRef))
+
+            if i > 0:
+                gapDiff[i - 1] = gaps[i - 1] - gaps[i] + sdk[i]
+        # print(gapDiff)
+        for i in range(len(gapDiff)):
+            if gapDiff[i] >= 0:
+                select_k = i+1
+                break
+        # if select_k == 1:
+        #     print('No attack detected!')
+        # else:
+        #     print('Attack Detected!')
+        return select_k
+    
+    def simple_mean(old_gradients, param_list, net, lr, b=0, hvp=None):
+        if hvp is not None:
+            pred_grad = []
+            distance = []
+            for i in range(len(old_gradients)):
+                pred_grad.append(old_gradients[i] + hvp)
+
+            pred = np.zeros(100)
+            pred[:b] = 1
+            distance = torch.norm((torch.cat(old_gradients, dim=1) - torch.cat(param_list, dim=1)), axis=0).asnumpy()
+            auc1 = roc_auc_score(pred, distance)
+            distance = torch.norm((torch.cat(pred_grad, dim=1) - torch.cat(param_list, dim=1)), axis=0).asnumpy()
+            auc2 = roc_auc_score(pred, distance)
+            
+            # normalize distance
+            distance = distance / np.sum(distance)
+        else:
+            distance = None
+
+        mean_torch = torch.mean(torch.cat(param_list, dim=1), axis=-1, keepdims=1)
+
+        idx = 0
+        for j, (param) in enumerate(net.collect_params().values()):
+            if param.grad_req == 'null':
+                continue
+            param.set_data(param.data() - lr * mean_torch[idx:(idx + param.data().size)].reshape(param.data().shape))
+            idx += param.data().size
+        return mean_torch, distance
+
+    def median(old_gradients, param_list, net, lr, b=0, hvp=None):
+        if hvp is not None:
+            pred_grad = []
+            distance = []
+            for i in range(len(old_gradients)):
+                pred_grad.append(old_gradients[i] + hvp)
+
+            pred = np.zeros(100)
+            pred[:b] = 1
+            distance = torch.norm((torch.cat(old_gradients, dim=1) - torch.cat(param_list, dim=1)), axis=0).asnumpy()
+            auc1 = roc_auc_score(pred, distance)
+            distance = torch.norm((torch.cat(pred_grad, dim=1) - torch.cat(param_list, dim=1)), axis=0).asnumpy()
+            auc2 = roc_auc_score(pred, distance)
+            print("Detection AUC: %0.4f; Detection AUC: %0.4f" % (auc1, auc2))
+
+            # normalize distance
+            distance = distance / np.sum(distance)
+        else:
+            distance = None
+
+        if len(param_list) % 2 == 1:
+            median_torch = torch.cat(param_list, dim=1).sort(axis=-1)[:, len(param_list) // 2]
+        else:
+            median_torch = torch.cat(param_list, dim=1).sort(axis=-1)[:, len(param_list) // 2: len(param_list) // 2 + 1].mean(axis=-1, keepdims=1)
+
+        return median_torch, distance
+
+    tmp = []
+    for param in net.collect_params().values():
+        if param.grad_req != 'null':
+            tmp.append(param.data().copy())
+    weight = torch.cat([x.reshape((-1, 1)) for x in tmp], dim=0)
+
+    # use lbfgs to calculate hessian vector product
+    if niter > 20:
+        hvp = lbfgs(weight_record, grad_record, weight - last_weight)
+    else:
+        hvp = None
+    
+    grad, distance = median(old_grad_list, param_list, net, args.global_lr, args.nbyz, hvp)
+
+    # Update malicious distance score
+    if distance is not None and niter > 20:
+        malicious_score = np.row_stack((malicious_score, distance))
+
+    if malicious_score.shape[0] >= 11:
+        if detection1(np.sum(malicious_score[-10:], axis=0), args.nbyz)>1:
+            res = detection(np.sum(malicious_score[-10:], axis=0), args.nbyz)
+
+            num = 0
+            right = 0.0
+            false_pos = 0.0
+            false_neg = 0.0
+            # print(res)
+            for i in range(len(res)):
+                if res[i] == 0:
+                    if i < args.nbyz:
+                        right += 1
+                    else:
+                        false_pos += 1
+                else:
+                    if i < args.nbyz:
+                        false_neg += 1
+                    num += 1
+
+            n = len(param_list)
+            if args.byz_type != "no":
+                print("Predict accuracy rate: ", right/args.nbyz)
+                if niter % 10 == 0:
+                    utils.write_log(log_file, "Iteration %02d. Detect Acc %0.4f" % (niter, right / args.nbyz) + '\n')
+                    utils.write_log(log_file, "Iteration %02d. False Positive Rate %0.4f" % (niter, false_pos / (n-args.nbyz)) + '\n')
+                    utils.write_log(log_file, "Iteration %02d. False Negative Rate %0.4f" % (niter, false_neg / args.nbyz) + '\n')
+
+
+            if niter % 10 == 0:
+                utils.write_log(log_file, "Iteration %02d. Detect Acc %0.4f" % (niter, right / args.nbyz) + '\n')
+                
+
+            new_param_list = []
+            for i in range(n):
+                if res[i] == 1:
+                    new_param_list.append(param_list[i])
+            
+            grad, distance = median(old_grad_list, new_param_list, net, args.global_lr, args.nbyz, hvp)
+
+    if niter > 0:
+        weight_record.append(weight - last_weight)
+        grad_record.append(grad - last_grad)
+
+    # free memory & reset the list
+    if len(weight_record) > 10:
+        del weight_record[0]
+        del grad_record[0]
+
+    last_weight = weight
+    last_grad = grad
+    old_grad_list = param_list
+
+    global_update = grad
+    idx = 0
+    model_dict = net.state_dict()
+    datalist = [model_dict[key].clone() for key in model_dict.keys() if "num_batches_tracked" not in key]
+
+    data_list = []
+    for data in datalist:
+        size = 1
+        for item in data.shape:
+            size *= item
+            
+        temp = data - args.global_lr * global_update[idx:(idx+size)].reshape(data.shape)
+        data_list.append(temp)
+        idx += size
+    
+    j = 0
+    for name in model_dict.keys():
+        if "num_batches_tracked" not in name:
+            model_dict[name] = data_list[j]
+            j += 1
+    
     return model_dict

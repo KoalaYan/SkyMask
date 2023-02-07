@@ -203,12 +203,9 @@ def get_malicious_updates_fang_krum(all_updates, model_re, deviation, n_attacker
     return mal_update
 
 
-def lie_backdoor(origin_param, net, local_net, data, label, ctx, args, backdoor_type, alpha):
+def lie_backdoor(origin_params, net, local_net, data, label, ctx, args, backdoor_type, alpha):
     model_dict = deepcopy(net.state_dict())
-    if args.BN:
-        param_1 = [model_dict[key] for key in model_dict.keys() if "num_batches_tracked" not in key]
-    else:        
-        param_1 = [param.data.clone() for param in net.parameters()]
+    param_1 = [model_dict[key] for key in model_dict.keys() if "num_batches_tracked" not in key]
 
     local_net.load_state_dict(model_dict)
     optimizer = optim.SGD(local_net.parameters(), lr=args.global_lr)        
@@ -221,41 +218,32 @@ def lie_backdoor(origin_param, net, local_net, data, label, ctx, args, backdoor_
 
     train_data = DataLoader(TensorDataset(data,label),args.batch_size,shuffle=True,drop_last=False)
     
-    for i in range(args.local_iter):
+    for i in range(10):
         for j, item in enumerate(train_data):
             x, y = item
             optimizer.zero_grad()
             output = local_net(x)
-            loss = classification_loss(output, y)
+            loss = classification_loss(output, y) * alpha
             
             if alpha > 0:
                 dist_loss = 0
-                if args.BN:
-                    name_list = [key for key in model_dict.keys() if "num_batches_tracked" not in key] # [model_dict[key] for key in model_dict.keys() if "num_batches_tracked" not in key]
-                    for name, p in local_net.named_parameters():
-                        idx = name_list.index(name)
-                        dist_loss += dist_loss_func((param_1[idx] - p), origin_param[idx])
-                else:        
-                    for idx, p in enumerate(local_net.parameters()):
-                        print(dist_loss)
-                        dist_loss += dist_loss_func((param_1[idx] - p), origin_param[idx])
+                name_list = [key for key in model_dict.keys() if "num_batches_tracked" not in key] # [model_dict[key] for key in model_dict.keys() if "num_batches_tracked" not in key]
+                for name, p in local_net.named_parameters():
+                    idx = name_list.index(name)
+                    dist_loss += dist_loss_func((param_1[idx] - p), torch.mean(torch.stack([param[idx] for param in origin_params]), dim=0))
                 
-
                 if torch.isnan(dist_loss):
                     raise Exception("Got nan dist loss")
 
-                loss += dist_loss * alpha
+                loss += dist_loss * (1-alpha)
 
             if torch.isnan(loss):
                 raise Exception("Got nan loss")
             loss.backward(retain_graph=True)
             optimizer.step()
 
-    if args.BN:
-        model_dict_2 = deepcopy(local_net.state_dict())
-        param_2 = [model_dict_2[key] for key in model_dict_2.keys() if "num_batches_tracked" not in key]
-    else:        
-        param_2 = [param.data.clone() for param in local_net.parameters()]
+    model_dict_2 = deepcopy(local_net.state_dict())
+    param_2 = [model_dict_2[key] for key in model_dict_2.keys() if "num_batches_tracked" not in key]
 
     res = [(param_1[i]-param_2[i])  for i in range(len(param_2))]
 
