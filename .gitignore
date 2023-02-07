@@ -1,0 +1,15 @@
+data/
+__pycache__/
+*.pkl
+
+*.pt
+*.pth
+*.npy
+mask*/
+*.png
+*.jpg
+*.eps
+figure/
+
+*.txt
+*.output
