@@ -228,12 +228,6 @@ def main(args):
             t1 = time.time()
             model_dict = aggregation.fedavg(grad_list, net, args)
             t2 = time.time()
-        elif args.aggregation == "tolpegin":
-            grad_list = [torch.cat([xx.reshape((-1, 1)) for xx in x], dim=0) for x in grad_list]
-            grad_list = byz(grad_list, net, lr, nbyz, ctx, args)
-            t1 = time.time()
-            model_dict = aggregation.Tolpegin(grad_list, e, net, args, log_file)
-            t2 = time.time()
         elif args.aggregation == "trim":
             grad_list = [torch.cat([xx.reshape((-1, 1)) for xx in x], dim=0) for x in grad_list]
             grad_list = byz(grad_list, net, lr, nbyz, ctx, args)
@@ -257,6 +251,18 @@ def main(args):
             grad_list = byz(grad_list, net, lr, nbyz, ctx, args)
             t1 = time.time()
             model_dict = aggregation.bulyan(grad_list, net, args)
+            t2 = time.time()
+        elif args.aggregation == "tolpegin":
+            grad_list = [torch.cat([xx.reshape((-1, 1)) for xx in x], dim=0) for x in grad_list]
+            grad_list = byz(grad_list, net, lr, nbyz, ctx, args)
+            t1 = time.time()
+            model_dict = aggregation.Tolpegin(grad_list, e, net, args, log_file)
+            t2 = time.time()
+        elif args.aggregation == "fldetector":
+            grad_list = [torch.cat([xx.reshape((-1, 1)) for xx in x], dim=0) for x in grad_list]
+            grad_list = byz(grad_list, net, lr, nbyz, ctx, args)
+            t1 = time.time()
+            model_dict = aggregation.FLDetector(grad_list, e, net, args, log_file)
             t2 = time.time()
         elif args.aggregation == "skymask":
             server_data = server_data
@@ -282,6 +288,31 @@ def main(args):
 
             t1 = time.time()
             model_dict = aggregation.skymask(grad_list, data_list, masknet, ctx, e, server_data.to(ctx), server_label.to(ctx), net, args, log_file)
+            t2 = time.time()
+        elif args.aggregation == "skymask2":
+            server_data = server_data
+            server_label = server_label
+
+            grad_list.append(train(net, local_net, server_data.to(ctx), server_label.to(ctx), ctx, args))
+            grad_list = [torch.cat([xx.reshape((-1, 1)) for xx in x], dim=0) for x in grad_list]
+            grad_list = byz(grad_list, net, lr, nbyz, ctx, args)
+
+            param_list = []
+            for grad in grad_list:
+                data_item = []
+                idx = 0
+                for data in data_list:
+                    size = 1
+                    for item in data.shape:
+                        size *= item
+                    temp = data - args.local_lr * grad[idx:(idx+size)].reshape(data.shape)
+                    data_item.append(temp)
+                param_list.append(data_item)
+
+            masknet = create_masknet(param_list, args.net, ctx)
+
+            t1 = time.time()
+            model_dict = aggregation.skymask2(grad_list, data_list, masknet, ctx, e, server_data.to(ctx), server_label.to(ctx), net, args, log_file)
             t2 = time.time()
 
         net.load_state_dict(model_dict)

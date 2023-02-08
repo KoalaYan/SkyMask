@@ -244,6 +244,172 @@ def skymask(grad_list, datalist, masknet, ctx, niter, server_data, server_label,
 
     return model_dict
 
+def skymask2(grad_list, datalist, masknet, ctx, niter, server_data, server_label, net, args, log_file):
+    baseline = deepcopy(torch.squeeze(grad_list[-1]))
+    model_dict = deepcopy(net.state_dict())            
+    
+    nworker = len(grad_list)
+
+    if args.net == "cnn":
+        mask_lr = 1e7
+        clip_lmt = 1e-7
+    elif args.net == "resnet20":
+        mask_lr = 1e8
+        clip_lmt = 1e-7
+    elif args.net == "LR":
+        mask_lr = 1e7
+        clip_lmt = 1e-7
+
+    optimizer = optim.SGD(masknet.parameters(), lr=mask_lr)
+
+    temp = 1e4
+
+    for epoch in range(20):
+        masknet.train()
+        minibatch = np.random.choice(list(range(server_data.shape[0])), size=int(args.server_pc), replace=False)
+        optimizer.zero_grad()
+
+        output = masknet(server_data[minibatch])
+        loss = F.nll_loss(output, server_label[minibatch])
+        loss = loss.requires_grad_()
+
+        loss.backward(retain_graph=True)
+        utils.clip_gradient(optimizer=optimizer, grad_clip=clip_lmt)
+
+        optimizer.step()
+
+          
+        if epoch % 10 == 0:
+            if temp-loss < 1e-2:
+                break
+            else:
+                temp = loss
+
+    
+    data_list = [param.data for param in masknet.parameters()]
+    size = int(len(data_list)/nworker)
+    mask_list  = []
+    
+    t = torch.Tensor([args.thres]).to(ctx)  # threshold
+    for i in range(nworker):
+        mask = []
+        for j in range(size):
+            mask.append(torch.sigmoid(torch.flatten(data_list[i+j*nworker], start_dim=0, end_dim=-1)))
+        mask = torch.cat(mask)
+        out = (mask > t).float() * 1
+        mask_list.append(out.detach().cpu().numpy())
+
+    pca = PCA(n_components=2)
+    data = pca.fit_transform(mask_list)
+
+    nrefs = 10
+    ks = range(1,10)
+    label_list = []
+    # MC
+    shape = data.shape
+
+    x_max = data.max(axis=0)
+    x_min = data.min(axis=0)
+    dists = np.matrix(np.diag(x_max-x_min))
+    rands = np.random.random_sample(size=(shape[0], shape[1], nrefs))
+    for i in range(nrefs):
+        rands[:,:,i] = rands[:,:,i]*dists+x_min
+            
+    gaps = np.zeros((len(ks),))
+    gapDiff = np.zeros(len(ks)-1,)
+    sdk = np.zeros(len(ks),)
+    for (i,k) in enumerate(ks):        
+        estimator = KMeans(n_clusters=k)
+        estimator.fit(data)
+        cluster_res = estimator.labels_
+        label_list.append(cluster_res)
+        cluster_mean = estimator.cluster_centers_
+        
+        Wk = np.sum([np.square(data[m,:]-cluster_mean[cluster_res[m],:]) for m in range(shape[0])])
+        WkRef = np.zeros((rands.shape[2],))
+        for j in range(rands.shape[2]):        
+            estimator = KMeans(n_clusters=k)
+            estimator.fit(rands[:,:,j])
+            kml = estimator.labels_
+            kmc = estimator.cluster_centers_
+            WkRef[j] = np.sum([np.square(rands[m,:,j]-kmc[kml[m],:]) for m in range(shape[0])])
+        gaps[i] = np.log(np.mean(WkRef))-np.log(Wk)
+        sdk[i] = np.sqrt((1.0+nrefs)/nrefs)*np.std(np.log(WkRef))
+        
+    # cost = gaps
+    print(np.argmax(gaps))
+    if np.argmax(gaps) == 0:
+        res = 1 - label_list[0]
+        utils.write_log(log_file, "No attack\n")
+    else:
+        y_pred = label_list[1]
+        benign = 0
+        mali = 0
+        for f in y_pred:
+            if f==1:
+                benign+=1
+            else:
+                mali+=1
+        if y_pred[-1] == 0:
+            for idx,_ in enumerate(y_pred):
+                y_pred[idx] = (y_pred[idx]+1)%2
+        res = y_pred
+
+    num = 0
+    right = 0.0
+    false_pos = 0.0
+    false_neg = 0.0
+    # print(res)
+    for i in range(len(res)):
+        if res[i] == 0:
+            if i < args.nbyz and args.byz_type != 'no':
+                right += 1
+            else:
+                false_pos += 1
+        else:
+            if i < args.nbyz and args.byz_type != 'no':
+                false_neg += 1
+            num += 1
+    n = len(grad_list) - 1
+    if args.byz_type != "no":
+        print("Predict accuracy rate: ", right/args.nbyz)
+        if niter % 5 == 0:
+            utils.write_log(log_file, "Iteration %02d. Detect Acc %0.4f" % (niter, right / args.nbyz) + '\n')
+            utils.write_log(log_file, "Iteration %02d. False Positive Rate %0.4f" % (niter, false_pos / (n-args.nbyz)) + '\n')
+            utils.write_log(log_file, "Iteration %02d. False Negative Rate %0.4f" % (niter, false_neg / args.nbyz) + '\n')
+    else:
+        if niter % 5 == 0:
+            utils.write_log(log_file, "Iteration %02d. False Positive Rate %0.4f" % (niter, false_neg / n) + '\n')
+
+    new_param_list = []
+    weights = 1 / num 
+
+    for i in range(n):
+        if res[i] == 1:
+            new_param_list.append(grad_list[i] * weights)# / (torch.norm(grad_list[i]) + 1e-9) * torch.norm(baseline))
+    
+    global_update = torch.sum(torch.cat(new_param_list, dim=1), dim=-1)
+
+    idx = 0
+    
+    data_list = []
+    for data in datalist:
+        size = 1
+        for item in data.shape:
+            size *= item
+            
+        temp = data - args.global_lr * global_update[idx:(idx+size)].reshape(data.shape)
+        data_list.append(temp)
+        idx += size
+    
+    j = 0
+    for name in model_dict.keys():
+        if "num_batches_tracked" not in name:
+            model_dict[name] = data_list[j]
+            j += 1
+    
+    return model_dict
+
 def Tolpegin(grad_list, niter, net, args, log_file):
     model_dict = deepcopy(net.state_dict())
         
@@ -290,13 +456,16 @@ def Tolpegin(grad_list, niter, net, args, log_file):
     n = len(grad_list)
     if args.byz_type != "no":
         print("Predict accuracy rate: ", right/args.nbyz)
-        if niter % 10 == 0:
+        if niter % 5 == 0:
             utils.write_log(log_file, "Iteration %02d. Detect Acc %0.4f" % (niter, right / args.nbyz) + '\n')
             utils.write_log(log_file, "Iteration %02d. False Positive Rate %0.4f" % (niter, false_pos / (n-args.nbyz)) + '\n')
             utils.write_log(log_file, "Iteration %02d. False Negative Rate %0.4f" % (niter, false_neg / args.nbyz) + '\n')
+    else:
+        if niter % 5 == 0:
+            utils.write_log(log_file, "Iteration %02d. False Positive Rate %0.4f" % (niter, false_neg / n) + '\n')
 
 
-    if niter % 10 == 0:
+    if niter % 5 == 0:
         utils.write_log(log_file, "Iteration %02d. Detect Acc %0.4f" % (niter, right / args.nbyz) + '\n')
         # HERE
         if args.dataset == "HAR":
@@ -520,18 +689,22 @@ def bulyan(gradients, net, args):
 weight_record = []
 grad_record = []
 old_grad_list = []
+malicious_score = None
 last_weight = None
 last_grad = None
-def FLDetection(param_list, net, niter, args, log_file):
-    global weight_record, grad_record, old_grad_list, last_weight, last_grad
+def FLDetector(param_list, niter, net, args, log_file):
+    global weight_record, grad_record, old_grad_list, last_weight, last_grad, malicious_score
+    if niter == 0:        
+        malicious_score = np.zeros((1, args.nworkers))
+
     def lbfgs(S_k_list, Y_k_list, v):
         curr_S_k = torch.cat(S_k_list, dim=1)
         curr_Y_k = torch.cat(Y_k_list, dim=1)
-        S_k_time_Y_k = torch.dot(curr_S_k.T, curr_Y_k)
-        S_k_time_S_k = torch.dot(curr_S_k.T, curr_S_k)
-        R_k = np.triu(S_k_time_Y_k.asnumpy())
-        L_k = S_k_time_Y_k - torch.array(R_k)
-        sigma_k = torch.dot(Y_k_list[-1].T, S_k_list[-1]) / (torch.dot(S_k_list[-1].T, S_k_list[-1]))
+        S_k_time_Y_k = torch.mm(curr_S_k.T, curr_Y_k)
+        S_k_time_S_k = torch.mm(curr_S_k.T, curr_S_k)
+        R_k = torch.triu(S_k_time_Y_k)
+        L_k = S_k_time_Y_k - R_k
+        sigma_k = torch.mm(Y_k_list[-1].T, S_k_list[-1]) / (torch.mm(S_k_list[-1].T, S_k_list[-1]))
         D_k_diag = torch.diag(S_k_time_Y_k)
         upper_mat = torch.cat([sigma_k * S_k_time_S_k, L_k], dim=1)
         lower_mat = torch.cat([L_k.T, -torch.diag(D_k_diag)], dim=1)
@@ -539,8 +712,8 @@ def FLDetection(param_list, net, niter, args, log_file):
         mat_inv = torch.inverse(mat)
 
         approx_prod = sigma_k * v
-        p_mat = torch.cat([torch.dot(curr_S_k.T, sigma_k * v), torch.dot(curr_Y_k.T, v)], dim=0)
-        approx_prod -= torch.dot(torch.dot(torch.cat([sigma_k * curr_S_k, curr_Y_k], dim=1), mat_inv), p_mat)
+        p_mat = torch.cat([torch.mm(curr_S_k.T, sigma_k * v), torch.mm(curr_Y_k.T, v)], dim=0)
+        approx_prod -= torch.mm(torch.mm(torch.cat([sigma_k * curr_S_k, curr_Y_k], dim=1), mat_inv), p_mat)
 
         return approx_prod
 
@@ -592,10 +765,6 @@ def FLDetection(param_list, net, niter, args, log_file):
             if gapDiff[i] >= 0:
                 select_k = i+1
                 break
-        # if select_k == 1:
-        #     print('No attack detected!')
-        # else:
-        #     print('Attack Detected!')
         return select_k
     
     def simple_mean(old_gradients, param_list, net, lr, b=0, hvp=None):
@@ -607,9 +776,9 @@ def FLDetection(param_list, net, niter, args, log_file):
 
             pred = np.zeros(100)
             pred[:b] = 1
-            distance = torch.norm((torch.cat(old_gradients, dim=1) - torch.cat(param_list, dim=1)), axis=0).asnumpy()
+            distance = torch.norm((torch.cat(old_gradients, dim=1) - torch.cat(param_list, dim=1)), axis=0).cpu().numpy()
             auc1 = roc_auc_score(pred, distance)
-            distance = torch.norm((torch.cat(pred_grad, dim=1) - torch.cat(param_list, dim=1)), axis=0).asnumpy()
+            distance = torch.norm((torch.cat(pred_grad, dim=1) - torch.cat(param_list, dim=1)), axis=0).cpu().numpy()
             auc2 = roc_auc_score(pred, distance)
             
             # normalize distance
@@ -619,12 +788,6 @@ def FLDetection(param_list, net, niter, args, log_file):
 
         mean_torch = torch.mean(torch.cat(param_list, dim=1), axis=-1, keepdims=1)
 
-        idx = 0
-        for j, (param) in enumerate(net.collect_params().values()):
-            if param.grad_req == 'null':
-                continue
-            param.set_data(param.data() - lr * mean_torch[idx:(idx + param.data().size)].reshape(param.data().shape))
-            idx += param.data().size
         return mean_torch, distance
 
     def median(old_gradients, param_list, net, lr, b=0, hvp=None):
@@ -636,28 +799,29 @@ def FLDetection(param_list, net, niter, args, log_file):
 
             pred = np.zeros(100)
             pred[:b] = 1
-            distance = torch.norm((torch.cat(old_gradients, dim=1) - torch.cat(param_list, dim=1)), axis=0).asnumpy()
+            distance = torch.norm((torch.cat(old_gradients, dim=1) - torch.cat(param_list, dim=1)), dim=0).cpu().numpy()
             auc1 = roc_auc_score(pred, distance)
-            distance = torch.norm((torch.cat(pred_grad, dim=1) - torch.cat(param_list, dim=1)), axis=0).asnumpy()
+            distance = torch.norm((torch.cat(pred_grad, dim=1) - torch.cat(param_list, dim=1)), dim=0).cpu().numpy()
             auc2 = roc_auc_score(pred, distance)
-            print("Detection AUC: %0.4f; Detection AUC: %0.4f" % (auc1, auc2))
+            # print("Detection AUC: %0.4f; Detection AUC: %0.4f" % (auc1, auc2))
 
             # normalize distance
             distance = distance / np.sum(distance)
         else:
             distance = None
 
+        v_tran = torch.cat(param_list, dim=1)
+        sorted_updates = torch.sort(v_tran, 1)[0]
         if len(param_list) % 2 == 1:
-            median_torch = torch.cat(param_list, dim=1).sort(axis=-1)[:, len(param_list) // 2]
+            median_torch = sorted_updates[:, len(param_list) // 2]
         else:
-            median_torch = torch.cat(param_list, dim=1).sort(axis=-1)[:, len(param_list) // 2: len(param_list) // 2 + 1].mean(axis=-1, keepdims=1)
+           
+            median_torch = torch.mean(sorted_updates[:,len(param_list) // 2 - 1: len(param_list) // 2 + 1], 1)
 
         return median_torch, distance
-
-    tmp = []
-    for param in net.collect_params().values():
-        if param.grad_req != 'null':
-            tmp.append(param.data().copy())
+    
+    model_dict = net.state_dict()
+    tmp = [model_dict[key].clone() for key in model_dict.keys() if "num_batches_tracked" not in key]
     weight = torch.cat([x.reshape((-1, 1)) for x in tmp], dim=0)
 
     # use lbfgs to calculate hessian vector product
@@ -675,46 +839,49 @@ def FLDetection(param_list, net, niter, args, log_file):
     if malicious_score.shape[0] >= 11:
         if detection1(np.sum(malicious_score[-10:], axis=0), args.nbyz)>1:
             res = detection(np.sum(malicious_score[-10:], axis=0), args.nbyz)
+        else:
+            res = np.ones(len(param_list))
+            print("No attack")
 
-            num = 0
-            right = 0.0
-            false_pos = 0.0
-            false_neg = 0.0
-            # print(res)
-            for i in range(len(res)):
-                if res[i] == 0:
-                    if i < args.nbyz:
-                        right += 1
-                    else:
-                        false_pos += 1
+        num = 0
+        right = 0.0
+        false_pos = 0.0
+        false_neg = 0.0
+        # print(res)
+        for i in range(len(res)):
+            if res[i] == 0:
+                if i < args.nbyz:
+                    right += 1
                 else:
-                    if i < args.nbyz:
-                        false_neg += 1
-                    num += 1
+                    false_pos += 1
+            else:
+                if i < args.nbyz:
+                    false_neg += 1
+                num += 1
 
-            n = len(param_list)
-            if args.byz_type != "no":
-                print("Predict accuracy rate: ", right/args.nbyz)
-                if niter % 10 == 0:
-                    utils.write_log(log_file, "Iteration %02d. Detect Acc %0.4f" % (niter, right / args.nbyz) + '\n')
-                    utils.write_log(log_file, "Iteration %02d. False Positive Rate %0.4f" % (niter, false_pos / (n-args.nbyz)) + '\n')
-                    utils.write_log(log_file, "Iteration %02d. False Negative Rate %0.4f" % (niter, false_neg / args.nbyz) + '\n')
-
-
+        n = len(param_list)
+        if args.byz_type != "no":
+            print("Predict accuracy rate: ", right/args.nbyz)
             if niter % 10 == 0:
                 utils.write_log(log_file, "Iteration %02d. Detect Acc %0.4f" % (niter, right / args.nbyz) + '\n')
-                
+                utils.write_log(log_file, "Iteration %02d. False Positive Rate %0.4f" % (niter, false_pos / (n-args.nbyz)) + '\n')
+                utils.write_log(log_file, "Iteration %02d. False Negative Rate %0.4f" % (niter, false_neg / args.nbyz) + '\n')
+        
+        else:
+            if niter % 5 == 0:
+                utils.write_log(log_file, "Iteration %02d. False Positive Rate %0.4f" % (niter, false_neg / n) + '\n')
 
-            new_param_list = []
-            for i in range(n):
-                if res[i] == 1:
-                    new_param_list.append(param_list[i])
-            
-            grad, distance = median(old_grad_list, new_param_list, net, args.global_lr, args.nbyz, hvp)
+
+        new_param_list = []
+        for i in range(n):
+            if res[i] == 1:
+                new_param_list.append(param_list[i])
+        
+        grad, distance = median(old_grad_list, new_param_list, net, args.global_lr, args.nbyz, hvp)
 
     if niter > 0:
         weight_record.append(weight - last_weight)
-        grad_record.append(grad - last_grad)
+        grad_record.append((grad - last_grad).reshape(-1,1))
 
     # free memory & reset the list
     if len(weight_record) > 10:
