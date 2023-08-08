@@ -3,6 +3,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 import numpy as np
 import os
+import hdbscan
 from copy import deepcopy
 from sklearn.decomposition import PCA
 from sklearn.cluster import KMeans
@@ -46,6 +47,65 @@ def fedavg(gradients, net, args):
             size *= item
             
         temp = data - args.global_lr * global_update[idx:(idx+size)].reshape(data.shape)
+        data_list.append(temp)
+        idx += size
+    
+    j = 0
+    for name in model_dict.keys():
+        if "num_batches_tracked" not in name:
+            model_dict[name] = data_list[j]
+            j += 1
+
+    return model_dict
+
+
+
+def flame(gradients, net, lr, device, args, epsilon=3000, delta=0.01):
+    n = len(gradients)
+    # compute pairwise cosine distances
+    cos_dist = torch.zeros((n, n), dtype=torch.double).to(device)
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = 1 - F.cosine_similarity(gradients[i], gradients[j], dim=0, eps=1e-9)
+            cos_dist[i, j], cos_dist[j, i] = d, d
+
+    # clustering of gradients
+    np_cos_dist = cos_dist.cpu().numpy()
+    clusterer = hdbscan.HDBSCAN(metric='precomputed', min_samples=1, min_cluster_size=(n // 2) + 1,
+                                cluster_selection_epsilon=0.0, allow_single_cluster=True).fit(np_cos_dist)
+
+    # compute clipping bound
+    euclid_dist = []
+    for grad in gradients:
+        euclid_dist.append(torch.norm(lr * grad, p=2))
+
+    clipping_bound, _ = torch.median(torch.stack(euclid_dist).reshape((-1, 1)), dim=0)
+
+    # gradient clipping
+    clipped_gradients = []
+    for i in range(n):
+        if clusterer.labels_[i] == 0:
+            gamma = clipping_bound / euclid_dist[i]
+            clipped_gradients.append(-lr * gradients[i] * torch.min(torch.ones((1,)).to(device), gamma))
+
+    # aggregation
+    global_update = torch.mean(torch.cat(clipped_gradients, dim=1), dim=-1)
+
+    # adaptive noise
+    std = (clipping_bound * np.sqrt(2 * np.log(1.25 / delta)) / epsilon) ** 2
+    global_update += torch.normal(mean=0, std=std.item(), size=tuple(global_update.size())).to(device)
+
+    idx = 0
+    model_dict = net.state_dict()
+    datalist = [model_dict[key].clone() for key in model_dict.keys() if "num_batches_tracked" not in key]
+
+    data_list = []
+    for data in datalist:
+        size = 1
+        for item in data.shape:
+            size *= item
+            
+        temp = data + global_update[idx:(idx+size)].reshape(data.shape)
         data_list.append(temp)
         idx += size
     

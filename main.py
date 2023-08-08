@@ -221,12 +221,17 @@ def main(args):
             t1 = time.time()
             model_dict = aggregation.fltrust(grad_list, net, ctx, args)
             t2 = time.time()
-            
         elif args.aggregation == "fedavg":
             grad_list = [torch.cat([xx.reshape((-1, 1)) for xx in x], dim=0) for x in grad_list]
             grad_list = byz(grad_list, net, lr, nbyz, ctx, args)
             t1 = time.time()
             model_dict = aggregation.fedavg(grad_list, net, args)
+            t2 = time.time()
+        elif args.aggregation == 'flame':
+            grad_list = [torch.cat([xx.reshape((-1, 1)) for xx in x], dim=0) for x in grad_list]
+            grad_list = byz(grad_list, net, lr, nbyz, ctx, args)
+            t1 = time.time()
+            model_dict = aggregation.flame(grad_list, net, args.global_lr, ctx, args, epsilon=3000, delta=0.01)
             t2 = time.time()
         elif args.aggregation == "trim":
             grad_list = [torch.cat([xx.reshape((-1, 1)) for xx in x], dim=0) for x in grad_list]
