@@ -15,3 +15,6 @@ This repository contains the Official Pytorch Implementation for SkyMask: Attack
 
 If the project is useful to you, please give us a star. ⭐️
 
+## Framework
+![arch-horizon](https://github.com/KoalaYan/SkyMask/assets/48938458/b16f445b-aba8-40a2-93cf-1023e82a1671)
+
